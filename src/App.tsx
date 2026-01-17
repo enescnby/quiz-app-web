@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { HubConnection, HubConnectionBuilder, HubConnectionState, LogLevel } from '@microsoft/signalr';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { BookOpen } from "lucide-react";
-import { QuizPage, Question } from "./components/QuizPage";
+import { QuizPage, Question, QuestionId } from "./components/QuizPage";
 import { QuizResult } from "./components/QuizResult";
 import { GameModeSelection } from "./components/GameModeSelection";
 import { CategorySelection, Category } from "./components/CategorySelection";
@@ -19,6 +20,7 @@ type GameMode = 'solo' | 'duel';
 
 type TokenPayload = {
   permissions?: string[];
+  sub?: string;
   [key: string]: unknown;
 };
 
@@ -35,10 +37,29 @@ type UserStats = {
   totalCorrectAnswers: number;
 };
 
+type DuelPlayerState = {
+  name?: string;
+  score: number;
+  correct: number;
+  wrong: number;
+  answered: number;
+};
+
+type DuelSession = {
+  code: string;
+  status: string;
+  questions: Question[];
+  players: DuelPlayerState[];
+  createdAt?: string;
+  updatedAt?: string;
+};
+
 const REQUIRED_ADMIN_PERMISSIONS = new Set(['create:quiz', 'create:question']);
 const CORRECT_OPTION_KEYS = ['a', 'b', 'c', 'd'] as const;
 const CORRECT_OPTION_LETTERS = ['A', 'B', 'C', 'D'] as const;
 const DEFAULT_FETCH_COUNT = 3;
+const DUEL_DEFAULT_QUESTION_COUNT = 10;
+const DUEL_HUB_PATH = '/hubs/duel';
 const CATEGORY_PAYLOAD_MAP: Record<string, { slug: string; name: string }> = {
   'Genel Kültür': { slug: 'general', name: 'General' },
   'Tarih': { slug: 'history', name: 'History' },
@@ -250,6 +271,34 @@ const normalizeFetchedQuestions = (payload: unknown, fallbackCategoryName: strin
     .filter((question): question is Question => question !== null);
 };
 
+const resolveQuestionId = (record: ApiQuestionRecord, index: number): QuestionId => {
+  const idCandidate =
+    record['id'] ??
+    record['questionId'] ??
+    record['QuestionId'] ??
+    record['questionID'] ??
+    record['QuestionID'] ??
+    record['testQuestionId'] ??
+    record['TestQuestionId'] ??
+    record['questionCategoryId'] ??
+    record['questionCategoryID'] ??
+    record['questionCategory'];
+
+  if (typeof idCandidate === 'number' && Number.isFinite(idCandidate)) {
+    return idCandidate;
+  }
+
+  if (typeof idCandidate === 'string') {
+    const trimmed = idCandidate.trim();
+    if (trimmed) {
+      const parsed = Number.parseInt(trimmed, 10);
+      return Number.isFinite(parsed) ? parsed : trimmed;
+    }
+  }
+
+  return 10000 + index;
+};
+
 const normalizeSingleQuestion = (item: unknown, fallbackCategoryName: string, index: number): Question | null => {
   if (!item || typeof item !== 'object') {
     return null;
@@ -280,16 +329,7 @@ const normalizeSingleQuestion = (item: unknown, fallbackCategoryName: string, in
 
   const correctIndex = deriveCorrectAnswerIndex(record, options);
 
-  const idCandidate = record['id'] ?? record['questionId'] ?? record['QuestionId'] ?? record['Id'] ?? record['TestQuestionId'];
-  let idValue = 10000 + index;
-  if (typeof idCandidate === 'number' && Number.isFinite(idCandidate)) {
-    idValue = idCandidate;
-  } else if (typeof idCandidate === 'string') {
-    const parsed = Number.parseInt(idCandidate, 10);
-    if (Number.isFinite(parsed)) {
-      idValue = parsed;
-    }
-  }
+  const idValue = resolveQuestionId(record, index);
 
   return {
     id: idValue,
@@ -367,6 +407,156 @@ const decodeTokenPayload = (token: string): TokenPayload | null => {
   }
 };
 
+const isGuidLike = (value: string | null | undefined): boolean => {
+  if (!value) {
+    return false;
+  }
+  const guidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+  return guidRegex.test(value.trim());
+};
+
+const resolveUserIdClaim = (payload: TokenPayload | null): string | null => {
+  if (!payload) {
+    return null;
+  }
+
+  const claimKeys = [
+    'https://qioapp.com/userId',
+    'userId',
+    'user_id',
+    'sub',
+  ];
+
+  for (const key of claimKeys) {
+    const candidateRaw = payload[key];
+    if (typeof candidateRaw !== 'string') {
+      continue;
+    }
+    const candidate = candidateRaw.includes('|') ? candidateRaw.split('|').pop() ?? candidateRaw : candidateRaw;
+    if (isGuidLike(candidate)) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+};
+
+const getCategorySlug = (category?: Category): string => {
+  const mapped = category ? CATEGORY_PAYLOAD_MAP[category] : undefined;
+  return mapped?.slug ?? CATEGORY_PAYLOAD_MAP['Genel Kültür'].slug;
+};
+
+const normalizeDuelPlayers = (payload: unknown): DuelPlayerState[] => {
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  return payload
+    .map((item, index) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+      const record = item as ApiQuestionRecord;
+      const name =
+        toTrimmedString(record['name']) ??
+        toTrimmedString(record['username']) ??
+        toTrimmedString(record['userName']) ??
+        toTrimmedString(record['displayName']) ??
+        toTrimmedString(record['playerName']) ??
+        `Oyuncu ${index + 1}`;
+
+      return {
+        name,
+        score: toNumber(record['score'] ?? record['points'] ?? record['totalScore']),
+        correct: toNumber(record['correct'] ?? record['correctCount'] ?? record['correctAnswers']),
+        wrong: toNumber(record['wrong'] ?? record['wrongCount'] ?? record['wrongAnswers']),
+        answered: toNumber(record['answered'] ?? record['answeredCount']),
+      };
+    })
+    .filter((player): player is DuelPlayerState => player !== null);
+};
+
+const normalizeDuelSession = (payload: unknown, fallbackCategory?: Category): DuelSession | null => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const record = payload as ApiQuestionRecord;
+  const code = toTrimmedString(record['code'] ?? record['sessionCode'] ?? record['Code']);
+  if (!code) {
+    return null;
+  }
+
+  const status = toTrimmedString(record['status'] ?? record['Status']) ?? 'waiting';
+
+  const questionsRaw = Array.isArray(record['questions'])
+    ? record['questions']
+    : Array.isArray(record['Questions'])
+      ? record['Questions']
+      : extractQuestionCollection(record['questions'] ?? record['Questions']);
+
+  const normalizedQuestions = (questionsRaw ?? [])
+    .map((item, index) => {
+      if (!item || typeof item !== 'object') {
+        return null;
+      }
+
+      const questionRecord = item as ApiQuestionRecord;
+      const questionText =
+        toTrimmedString(questionRecord['text']) ??
+        toTrimmedString(questionRecord['question']) ??
+        toTrimmedString(questionRecord['questionText']) ??
+        `Soru ${index + 1}`;
+
+      const options = extractOptionTexts(questionRecord);
+      if (options.length < 2) {
+        return null;
+      }
+
+      const idCandidate =
+        questionRecord['id'] ??
+        questionRecord['questionId'] ??
+        questionRecord['QuestionId'] ??
+        questionRecord['QuestionID'];
+
+      const idValue = resolveQuestionId(questionRecord, index);
+
+      return {
+        id: idValue,
+        question: questionText,
+        options,
+        correctAnswer: 0,
+        category: fallbackCategory ?? 'Düello',
+      };
+    })
+    .filter((question): question is Question => question !== null);
+
+  const playersRaw =
+    Array.isArray(record['players']) ? record['players']
+    : Array.isArray(record['Players']) ? record['Players']
+    : [];
+  const players = normalizeDuelPlayers(playersRaw);
+
+  const createdAt =
+    toTrimmedString(record['createdAt']) ??
+    toTrimmedString(record['CreatedAt']) ??
+    toTrimmedString(record['createdOn']);
+
+  const updatedAt =
+    toTrimmedString(record['updatedAt']) ??
+    toTrimmedString(record['UpdatedAt']) ??
+    toTrimmedString(record['updatedOn']);
+
+  return {
+    code,
+    status,
+    questions: normalizedQuestions,
+    players,
+    createdAt: createdAt ?? undefined,
+    updatedAt: updatedAt ?? undefined,
+  };
+};
+
 export default function App() {
   const { isLoading, isAuthenticated, user, loginWithRedirect, logout, getAccessTokenSilently } = useAuth0();
   const [currentPage, setCurrentPage] = useState<PageState>('auth');
@@ -383,8 +573,187 @@ export default function App() {
   const [profileStats, setProfileStats] = useState<UserStats | null>(null);
   const [isFetchingProfileStats, setIsFetchingProfileStats] = useState(false);
   const [profileStatsError, setProfileStatsError] = useState<string | null>(null);
+  const [duelSession, setDuelSession] = useState<DuelSession | null>(null);
+  const [isLoadingDuelSession, setIsLoadingDuelSession] = useState(false);
+  const [duelError, setDuelError] = useState<string | null>(null);
+  const [duelScores, setDuelScores] = useState<{ player: number; opponent: number }>({ player: 0, opponent: 0 });
+  const duelHubRef = useRef<HubConnection | null>(null);
+  const duelSessionCodeRef = useRef<string | null>(null);
+  const duelUserIdRef = useRef<string | null>(null);
 
   const audience = import.meta.env.VITE_AUTH0_AUDIENCE;
+
+  const resetDuelState = useCallback(() => {
+    setDuelSession(null);
+    setDuelError(null);
+    setIsLoadingDuelSession(false);
+    setDuelScores({ player: 0, opponent: 0 });
+    duelSessionCodeRef.current = null;
+    if (duelHubRef.current) {
+      duelHubRef.current.stop().catch((error) => console.error('Duel hub stop failed', error));
+      duelHubRef.current = null;
+    }
+  }, []);
+
+  const resolveDuelScoresFromPlayers = useCallback((players: DuelPlayerState[]) => {
+    const player = players[0]?.score ?? 0;
+    const opponent = players[1]?.score ?? 0;
+    setDuelScores({
+      player: toNumber(player),
+      opponent: toNumber(opponent),
+    });
+  }, []);
+
+  const getApiBaseUrl = () => {
+    const baseUrlEnv = import.meta.env.VITE_API_BASE_URL ?? 'https://localhost:5001';
+    return baseUrlEnv.endsWith('/') ? baseUrlEnv.slice(0, -1) : baseUrlEnv;
+  };
+
+  const getDuelHubUrl = () => `${getApiBaseUrl()}${DUEL_HUB_PATH}`;
+
+  const applyDuelSessionUpdate = useCallback((payload: unknown, fallbackCategory?: Category) => {
+    const normalized = normalizeDuelSession(payload, fallbackCategory);
+    if (!normalized) {
+      console.warn('[Qio] Invalid duel session payload', payload);
+      return null;
+    }
+
+    setDuelSession((prev) => {
+      const mergedQuestions = normalized.questions.length
+        ? normalized.questions
+        : prev?.questions ?? [];
+      const mergedPlayers = normalized.players.length
+        ? normalized.players
+        : prev?.players ?? [];
+
+      const nextSession: DuelSession = {
+        ...normalized,
+        questions: mergedQuestions,
+        players: mergedPlayers,
+      };
+
+      resolveDuelScoresFromPlayers(nextSession.players);
+      duelSessionCodeRef.current = nextSession.code;
+      return nextSession;
+    });
+
+    return normalized;
+  }, [resolveDuelScoresFromPlayers]);
+
+  const handleSessionUpdatedEvent = useCallback((payload: unknown) => {
+    const normalized = applyDuelSessionUpdate(payload, selectedCategory);
+    if (normalized) {
+      setDuelError(null);
+    }
+    setIsLoadingDuelSession(false);
+  }, [applyDuelSessionUpdate, selectedCategory]);
+
+  const handleAnswerResultEvent = useCallback((payload: unknown) => {
+    if (!payload || typeof payload !== 'object') {
+      return;
+    }
+
+    const record = payload as ApiQuestionRecord;
+    const playerScore = toOptionalNumber(record['playerScore'] ?? record['PlayerScore']);
+    const opponentScore = toOptionalNumber(record['opponentScore'] ?? record['OpponentScore']);
+    const status = toTrimmedString(record['status'] ?? record['Status']);
+    const correctOption = toTrimmedString(record['correctOption'] ?? record['CorrectOption']);
+    const isCompletedRaw = record['isCompleted'] ?? record['IsCompleted'];
+    const isCompleted = typeof isCompletedRaw === 'boolean'
+      ? isCompletedRaw
+      : typeof isCompletedRaw === 'string'
+        ? isCompletedRaw.toLowerCase() === 'true'
+        : false;
+
+    if (playerScore !== null || opponentScore !== null) {
+      setDuelScores((prev) => ({
+        player: playerScore ?? prev.player,
+        opponent: opponentScore ?? prev.opponent,
+      }));
+    }
+
+    if (status) {
+      setDuelSession((prev) => prev ? { ...prev, status } : prev);
+    } else if (isCompleted) {
+      setDuelSession((prev) => prev ? { ...prev, status: 'completed' } : prev);
+    }
+
+    if (correctOption) {
+      console.info('[Qio] AnswerResult', {
+        correctOption,
+        playerScore,
+        opponentScore,
+        status,
+        isCompleted,
+      });
+    }
+  }, []);
+
+  const attachDuelHubListeners = useCallback((connection: HubConnection) => {
+    connection.off('SessionUpdated');
+    connection.off('AnswerResult');
+
+    connection.on('SessionUpdated', handleSessionUpdatedEvent);
+    connection.on('AnswerResult', handleAnswerResultEvent);
+  }, [handleAnswerResultEvent, handleSessionUpdatedEvent]);
+
+  const ensureDuelHubConnection = useCallback(async () => {
+    if (!audience) {
+      throw new Error('API audience yapılandırması eksik.');
+    }
+
+    const existing = duelHubRef.current;
+    if (existing) {
+      attachDuelHubListeners(existing);
+      if (existing.state === HubConnectionState.Disconnected) {
+        await existing.start();
+      }
+      if (existing.state !== HubConnectionState.Connected) {
+        throw new Error('Düello bağlantısı yeniden kurulamadı, lütfen tekrar deneyin.');
+      }
+      return existing;
+    }
+
+    const hubUrl = getDuelHubUrl();
+    const connection = new HubConnectionBuilder()
+      .withUrl(hubUrl, {
+        accessTokenFactory: () =>
+          getAccessTokenSilently({
+            authorizationParams: {
+              audience,
+            },
+          }),
+      })
+      .withAutomaticReconnect()
+      .configureLogging(LogLevel.Information)
+      .build();
+
+    connection.onclose((error) => {
+      if (error) {
+        console.error('Duel hub connection closed unexpectedly', error);
+      }
+    });
+
+    connection.onreconnected(() => {
+      const activeCode = duelSessionCodeRef.current;
+      if (activeCode) {
+        connection.invoke('JoinSession', activeCode)
+          .then((payload) => applyDuelSessionUpdate(payload, selectedCategory))
+          .catch((error) => {
+            console.error('Failed to re-sync duel session after reconnect', error);
+          });
+      }
+    });
+
+    attachDuelHubListeners(connection);
+
+    await connection.start();
+    if (connection.state !== HubConnectionState.Connected) {
+      throw new Error('Düello bağlantısı başlatılamadı.');
+    }
+    duelHubRef.current = connection;
+    return connection;
+  }, [applyDuelSessionUpdate, audience, attachDuelHubListeners, getAccessTokenSilently, getDuelHubUrl, selectedCategory]);
 
   const userEmail = user?.email ?? '';
   const userNickname = user?.nickname ?? '';
@@ -396,6 +765,8 @@ export default function App() {
     'Qio Kullanıcısı';
   const isAdmin = hasCreateQuizPermission;
 
+  const prevDuelPlayerCountRef = useRef<number>(0);
+
   const handleAuthLogout = () => {
     setFetchedQuestions([]);
     setFetchQuestionsError(null);
@@ -403,6 +774,7 @@ export default function App() {
     setProfileStats(null);
     setProfileStatsError(null);
     setIsFetchingProfileStats(false);
+    resetDuelState();
     setCurrentPage('auth');
     logout({ logoutParams: { returnTo: window.location.origin } });
   };
@@ -418,27 +790,31 @@ export default function App() {
 
   useEffect(() => {
     const fetchPermissions = async () => {
-      if (!isAuthenticated || !audience) {
-        setHasCreateQuizPermission(false);
-        setTokenUsername('');
-        return;
-      }
+    if (!isAuthenticated || !audience) {
+      setHasCreateQuizPermission(false);
+      setTokenUsername('');
+      duelUserIdRef.current = null;
+      return;
+    }
 
-      try {
-        const token = await getAccessTokenSilently({
+    try {
+      const token = await getAccessTokenSilently({
           authorizationParams: {
             audience,
           },
         });
 
-        const payload = decodeTokenPayload(token);
-        const permissions = Array.isArray(payload?.permissions) ? payload?.permissions : [];
-        setHasCreateQuizPermission(permissions.some(permission => REQUIRED_ADMIN_PERMISSIONS.has(permission)));
+      const payload = decodeTokenPayload(token);
+      const permissions = Array.isArray(payload?.permissions) ? payload?.permissions : [];
+      setHasCreateQuizPermission(permissions.some(permission => REQUIRED_ADMIN_PERMISSIONS.has(permission)));
 
-        const usernameClaimRaw = payload?.['https://qioapp.com/username'];
-        const usernameClaim = typeof usernameClaimRaw === 'string' ? usernameClaimRaw.trim() : '';
+      const resolvedUserId = resolveUserIdClaim(payload);
+      duelUserIdRef.current = resolvedUserId;
 
-        setTokenUsername(usernameClaim || '');
+      const usernameClaimRaw = payload?.['https://qioapp.com/username'];
+      const usernameClaim = typeof usernameClaimRaw === 'string' ? usernameClaimRaw.trim() : '';
+
+      setTokenUsername(usernameClaim || '');
       } catch (error) {
         console.error('Failed to retrieve access token', error);
         setHasCreateQuizPermission(false);
@@ -448,6 +824,15 @@ export default function App() {
 
     fetchPermissions();
   }, [isAuthenticated, getAccessTokenSilently, audience]);
+
+  useEffect(() => {
+    return () => {
+      if (duelHubRef.current) {
+        duelHubRef.current.stop().catch((error) => console.error('Duel hub cleanup failed', error));
+        duelHubRef.current = null;
+      }
+    };
+  }, []);
 
   const handleNavigate = (page: 'gameMode' | 'profile' | 'friends' | 'admin') => {
     if (page === 'admin' && !isAdmin) {
@@ -471,9 +856,191 @@ export default function App() {
     setNextQuestionId(nextQuestionId + 1);
   };
 
-  const handleDeleteQuestion = (id: number) => {
+  const handleDeleteQuestion = (id: QuestionId) => {
     setQuizQuestions((prev) => prev.filter(q => q.id !== id));
   };
+
+  const createDuelSessionForCategory = useCallback(async (category: Category) => {
+    if (!audience) {
+      throw new Error('API audience yapılandırması eksik.');
+    }
+
+    setIsLoadingDuelSession(true);
+    setDuelError(null);
+
+    try {
+      const connection = await ensureDuelHubConnection();
+      const body = {
+        categorySlug: getCategorySlug(category),
+        questionCount: DUEL_DEFAULT_QUESTION_COUNT,
+        userId: duelUserIdRef.current ?? undefined,
+      };
+
+      console.info('[Qio] Create duel session (SignalR)', {
+        body,
+        hubUrl: getDuelHubUrl(),
+      });
+
+      const payload = await connection.invoke('CreateSession', body);
+      const normalized = applyDuelSessionUpdate(payload, category);
+      if (!normalized) {
+        throw new Error('Düello oturumu oluşturulamadı.');
+      }
+
+      return normalized;
+    } catch (error) {
+      console.error('Düello oturumu oluşturulamadı', error);
+      const message = error instanceof Error ? error.message : 'Düello oturumu oluşturulamadı.';
+      setDuelError(message);
+      throw error instanceof Error ? error : new Error(message);
+    } finally {
+      setIsLoadingDuelSession(false);
+    }
+  }, [applyDuelSessionUpdate, audience, ensureDuelHubConnection]);
+
+  const joinDuelSessionWithCode = useCallback(async (code: string, category?: Category) => {
+    if (!audience) {
+      throw new Error('API audience yapılandırması eksik.');
+    }
+
+    const trimmedCode = code.trim();
+    if (!trimmedCode) {
+      throw new Error('Geçerli bir düello kodu girin.');
+    }
+
+    setIsLoadingDuelSession(true);
+    setDuelError(null);
+
+    try {
+      const connection = await ensureDuelHubConnection();
+
+      console.info('[Qio] Join duel session (SignalR)', {
+        hubUrl: getDuelHubUrl(),
+        code: trimmedCode,
+      });
+
+      const payload = await connection.invoke('JoinSession', trimmedCode);
+      const normalized = applyDuelSessionUpdate(payload, category);
+      if (!normalized) {
+        throw new Error('Düello oturumu yanıtı geçersiz.');
+      }
+
+      return normalized;
+    } catch (error) {
+      console.error('Düello oturumuna katılınamadı', error);
+      const message = error instanceof Error ? error.message : 'Düello oturumuna katılınamadı.';
+      setDuelError(message);
+      throw error instanceof Error ? error : new Error(message);
+    } finally {
+      setIsLoadingDuelSession(false);
+    }
+  }, [applyDuelSessionUpdate, audience, ensureDuelHubConnection]);
+
+  const refreshDuelSession = useCallback(async (code: string, category?: Category) => {
+    if (!audience) {
+      throw new Error('API audience yapılandırması eksik.');
+    }
+
+    const trimmedCode = code.trim();
+    if (!trimmedCode) {
+      throw new Error('Düello kodu bulunamadı.');
+    }
+
+    setIsLoadingDuelSession(true);
+    setDuelError(null);
+
+    try {
+      const connection = await ensureDuelHubConnection();
+
+      console.info('[Qio] Refresh duel session (SignalR)', {
+        hubUrl: getDuelHubUrl(),
+        code: trimmedCode,
+      });
+
+      const payload = await connection.invoke('GetSession', trimmedCode);
+      const normalized = applyDuelSessionUpdate(payload, category);
+      if (!normalized) {
+        throw new Error('Düello oturumu alınamadı.');
+      }
+
+      return normalized;
+    } catch (error) {
+      console.error('Düello oturumu alınamadı', error);
+      const message = error instanceof Error ? error.message : 'Düello oturumu alınamadı.';
+      setDuelError(message);
+      throw error instanceof Error ? error : new Error(message);
+    } finally {
+      setIsLoadingDuelSession(false);
+    }
+  }, [applyDuelSessionUpdate, audience, ensureDuelHubConnection]);
+
+  const submitDuelAnswer = useCallback(async (questionId: QuestionId, answerIndex: number) => {
+    if (!audience) {
+      throw new Error('API audience yapılandırması eksik.');
+    }
+
+    if (!duelSession?.code) {
+      throw new Error('Aktif bir düello oturumu bulunamadı.');
+    }
+
+    const boundedIndex = clampAnswerIndex(answerIndex);
+    const selectedOption = CORRECT_OPTION_KEYS[boundedIndex];
+
+    try {
+      const connection = await ensureDuelHubConnection();
+
+      console.info('[Qio] Submit duel answer (SignalR)', {
+        hubUrl: getDuelHubUrl(),
+        code: duelSession.code,
+        questionId,
+        selectedOption,
+      });
+
+      const payloadRecord = await connection.invoke<ApiQuestionRecord>('SubmitAnswer', duelSession.code, {
+        questionId,
+        selectedOption,
+        userId: duelUserIdRef.current ?? undefined,
+      });
+
+      const isCorrectRaw = payloadRecord['isCorrect'] ?? payloadRecord['IsCorrect'];
+      const correctOptionRaw = toTrimmedString(payloadRecord['correctOption']) ?? toTrimmedString(payloadRecord['CorrectOption']);
+      const playerScoreRaw = payloadRecord['playerScore'] ?? payloadRecord['PlayerScore'];
+      const opponentScoreRaw = payloadRecord['opponentScore'] ?? payloadRecord['OpponentScore'];
+      const statusRaw = payloadRecord['status'] ?? payloadRecord['duelStatus'] ?? payloadRecord['Status'];
+      const isCompletedRaw = payloadRecord['isCompleted'] ?? payloadRecord['IsCompleted'];
+
+      const playerScore = toNumber(playerScoreRaw);
+      const opponentScore = toNumber(opponentScoreRaw);
+
+      setDuelScores({
+        player: playerScore,
+        opponent: opponentScore,
+      });
+
+      const status = toTrimmedString(statusRaw);
+      if (status) {
+        setDuelSession((prev) => prev ? { ...prev, status } : prev);
+      }
+
+      const isCompleted = typeof isCompletedRaw === 'boolean'
+        ? isCompletedRaw
+        : typeof isCompletedRaw === 'string'
+          ? isCompletedRaw.toLowerCase() === 'true'
+          : false;
+
+      return {
+        isCorrect: typeof isCorrectRaw === 'boolean' ? isCorrectRaw : String(isCorrectRaw).toLowerCase() === 'true',
+        correctOption: correctOptionRaw?.toUpperCase() ?? null,
+        playerScore,
+        opponentScore,
+        status: status ?? null,
+        isCompleted,
+      };
+    } catch (error) {
+      console.error('Düello cevabı gönderilemedi', error);
+      throw error instanceof Error ? error : new Error('Düello cevabı gönderilemedi.');
+    }
+  }, [audience, duelSession, ensureDuelHubConnection]);
 
   const fetchQuestionsForCategory = useCallback(async (category: Category) => {
     setIsFetchingQuestions(true);
@@ -623,13 +1190,34 @@ export default function App() {
     fetchProfileStats();
   }, [isAuthenticated, currentPage, fetchProfileStats]);
 
-  const submitGuessForQuestion = useCallback(async (questionId: number, answerIndex: number) => {
+  useEffect(() => {
+    const playerCount = duelSession?.players?.length ?? 0;
+    const previousCount = prevDuelPlayerCountRef.current;
+    prevDuelPlayerCountRef.current = playerCount;
+
+    if (
+      selectedGameMode === 'duel' &&
+      currentPage === 'quiz' &&
+      previousCount >= 2 &&
+      playerCount < 2
+    ) {
+      toast.error('Rakibin odadan ayrıldı. Oturum kapatıldı.');
+      resetDuelState();
+      setCurrentPage('category');
+    }
+  }, [currentPage, duelSession?.players?.length, resetDuelState, selectedGameMode]);
+
+  const submitGuessForQuestion = useCallback(async (questionId: QuestionId, answerIndex: number) => {
     if (!audience) {
       throw new Error('API audience yapılandırması eksik.');
     }
 
     const boundedIndex = clampAnswerIndex(answerIndex);
     const optionLetter = CORRECT_OPTION_LETTERS[boundedIndex];
+    const numericId = typeof questionId === 'string' ? Number.parseInt(questionId, 10) : questionId;
+    if (!Number.isFinite(numericId)) {
+      throw new Error('Geçersiz soru kimliği.');
+    }
 
     try {
       const token = await getAccessTokenSilently({
@@ -640,7 +1228,7 @@ export default function App() {
 
       const baseUrlEnv = import.meta.env.VITE_API_BASE_URL ?? 'https://localhost:5001';
       const apiBaseUrl = baseUrlEnv.endsWith('/') ? baseUrlEnv.slice(0, -1) : baseUrlEnv;
-      const endpoint = `${apiBaseUrl}/api/question/guess/${questionId}/${optionLetter.toLowerCase()}`;
+      const endpoint = `${apiBaseUrl}/api/question/guess/${numericId}/${optionLetter.toLowerCase()}`;
 
       console.info('[Qio] Submit guess', {
         questionId,
@@ -690,9 +1278,14 @@ export default function App() {
     }
   }, [audience, getAccessTokenSilently]);
 
-  const reportQuestion = useCallback(async (questionId: number, reason: string) => {
+  const reportQuestion = useCallback(async (questionId: QuestionId, reason: string) => {
     if (!audience) {
       throw new Error('API audience yapılandırması eksik.');
+    }
+
+    const numericId = typeof questionId === 'string' ? Number.parseInt(questionId, 10) : questionId;
+    if (!Number.isFinite(numericId)) {
+      throw new Error('Geçersiz soru kimliği.');
     }
 
     const token = await getAccessTokenSilently({
@@ -703,7 +1296,7 @@ export default function App() {
 
     const baseUrlEnv = import.meta.env.VITE_API_BASE_URL ?? 'https://localhost:5001';
     const apiBaseUrl = baseUrlEnv.endsWith('/') ? baseUrlEnv.slice(0, -1) : baseUrlEnv;
-    const endpoint = `${apiBaseUrl}/api/question/${questionId}/report`;
+    const endpoint = `${apiBaseUrl}/api/question/${numericId}/report`;
 
     console.info('[Qio] Report question', {
       questionId,
@@ -903,12 +1496,18 @@ export default function App() {
     setSelectedCategory(undefined);
     setFetchedQuestions([]);
     setFetchQuestionsError(null);
+    resetDuelState();
     setCurrentPage('category');
   };
 
   const handleCategorySelect = (category: Category) => {
     setSelectedCategory(category);
     setCurrentPage('quiz');
+
+    if (selectedGameMode === 'duel') {
+      resetDuelState();
+      return;
+    }
 
     fetchQuestionsForCategory(category).catch((error) => {
       const message = error instanceof Error ? error.message : 'Sorular alınamadı, lütfen tekrar deneyin.';
@@ -936,6 +1535,7 @@ export default function App() {
     setFetchedQuestions([]);
     setFetchQuestionsError(null);
     setSelectedCategory(undefined);
+    resetDuelState();
     setCurrentPage('category');
   };
 
@@ -943,6 +1543,7 @@ export default function App() {
     setFetchedQuestions([]);
     setFetchQuestionsError(null);
     setSelectedCategory(undefined);
+    resetDuelState();
     setCurrentPage('gameMode');
   };
 
@@ -1102,9 +1703,26 @@ export default function App() {
 
   // Quiz sayfasını göster
   if (currentPage === 'quiz') {
-    const questionsToUse = isFetchingQuestions
-      ? []
-      : (fetchedQuestions.length > 0 ? fetchedQuestions : quizQuestions);
+    const isDuelMode = selectedGameMode === 'duel';
+    const duelQuestions = duelSession?.questions ?? [];
+    const hasOpponent = (duelSession?.players?.length ?? 0) >= 2;
+    const questionsToUse = isDuelMode
+      ? duelQuestions
+      : isFetchingQuestions
+        ? []
+        : (fetchedQuestions.length > 0 ? fetchedQuestions : quizQuestions);
+    const isLoadingForQuiz = isDuelMode ? isLoadingDuelSession : isFetchingQuestions;
+    const errorForQuiz = isDuelMode ? (hasOpponent ? duelError : null) : fetchQuestionsError;
+
+    const retryFetchHandler = isDuelMode
+      ? (
+        duelSession?.code
+          ? () => refreshDuelSession(duelSession.code, selectedCategory)
+          : selectedCategory
+            ? () => createDuelSessionForCategory(selectedCategory)
+            : undefined
+      )
+      : handleRetryFetchQuestions;
 
     return (
       <>
@@ -1113,14 +1731,21 @@ export default function App() {
           category={selectedCategory}
           gameMode={selectedGameMode}
           questions={questionsToUse}
-          isLoadingQuestions={isFetchingQuestions}
-          errorMessage={fetchQuestionsError}
-          onRetryFetch={handleRetryFetchQuestions}
-          onSubmitGuess={submitGuessForQuestion}
+          isLoadingQuestions={isLoadingForQuiz}
+          errorMessage={errorForQuiz}
+          onRetryFetch={retryFetchHandler}
+          onSubmitGuess={isDuelMode ? submitDuelAnswer : submitGuessForQuestion}
           onReportQuestion={reportQuestion}
           onComplete={handleQuizComplete}
           onBack={handleRestartQuiz}
           onExitToHome={handleBackToHome}
+          duelSessionCode={duelSession?.code}
+          duelStatus={duelSession?.status}
+          duelPlayers={duelSession?.players}
+          duelScores={duelScores}
+          onStartDuelSession={selectedCategory ? () => createDuelSessionForCategory(selectedCategory) : undefined}
+          onJoinDuelSession={(code) => joinDuelSessionWithCode(code, selectedCategory)}
+          onRefreshDuelSession={duelSession?.code ? () => refreshDuelSession(duelSession.code, selectedCategory) : undefined}
         />
         <Toaster />
       </>

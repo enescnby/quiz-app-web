@@ -56,9 +56,9 @@ export function GameModeSelection({ onSelectMode }: GameModeSelectionProps) {
           </Card>
 
           {/* Düello Mod */}
-          <Card className="relative border-2 opacity-75">
+          <Card className="relative border-2 hover:border-primary hover:shadow-xl transition-all hover:-translate-y-1">
             <div className="absolute top-4 right-4">
-              <Badge variant="secondary">Yakında</Badge>
+              <Badge variant="outline">Yeni</Badge>
             </div>
             <CardHeader>
               <div className="flex justify-center mb-4">
@@ -68,7 +68,7 @@ export function GameModeSelection({ onSelectMode }: GameModeSelectionProps) {
               </div>
               <CardTitle className="text-center">Düello Mod</CardTitle>
               <CardDescription className="text-center">
-                Arkadaşlarınızla yarışın ve kazanın
+                Arkadaşlarınızla gerçek zamanlı kapışın
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -87,11 +87,11 @@ export function GameModeSelection({ onSelectMode }: GameModeSelectionProps) {
                 </li>
               </ul>
               <Button 
-                disabled 
+                onClick={() => onSelectMode('duel')}
                 className="w-full"
                 size="lg"
               >
-                Yakında Gelecek
+                Düello Başlat
               </Button>
             </CardContent>
           </Card>
