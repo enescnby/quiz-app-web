@@ -1,11 +1,10 @@
+# Quiz App Web
 
-  # Kullanıcı Giriş Kayıt Sayfası (Copy)
+Yapılanlar: <br>
 
-  This is a code bundle for Kullanıcı Giriş Kayıt Sayfası (Copy). The original project is available at https://www.figma.com/design/uHnDHCY6uh3aPKWSDz8Foe/Kullan%C4%B1c%C4%B1-Giri%C5%9F-Kay%C4%B1t-Sayfas%C4%B1--Copy-.
-
-  ## Running the code
-
-  Run `npm i` to install the dependencies.
-
-  Run `npm run dev` to start the development server.
-  
+- Solo mod için kategoriler eklendi. Karışık hariç tüm kategoriler oynanabilir durumda.
+- Admin Paneli, soru ekleme ve raporları gözden geçirme işlevlerini içerecek şekilde oluşturuldu.
+- Profilde kullanıcı istatistikleri görülebilir hâle getirildi.
+- Auth0 kimlik doğrulama sistemi eklendi.
+- Kullanıcı için hatalı soruları raporlama seçeneği getirildi.
+- Hata durumları için (fetch sorunları gibi) tekrar dene butonu eklendi.
