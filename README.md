@@ -1,5 +1,7 @@
 # Quiz App Web
 
+Video Linki: https://drive.google.com/file/d/1WEufDX2Ub7SOIVK9N7yKEtjyhShQKw3G/view
+
 Yapılanlar: <br>
 
 - Solo mod için kategoriler eklendi. Karışık hariç tüm kategoriler oynanabilir durumda.
